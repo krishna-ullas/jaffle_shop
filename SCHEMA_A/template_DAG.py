@@ -1,130 +1,126 @@
+from pendulum import datetime
 from airflow import DAG
-from airflow.utils.task_group import TaskGroup
-from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
-from airflow.hooks.base import BaseHook
-from airflow.utils.dates import days_ago
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+from airflow.operators.email_operator import EmailOperator
+from datetime import datetime, timedelta
 from airflow.models import Variable
-import os
-import yaml
+from cosmos import DbtTaskGroup, RenderConfig
+from cosmos.config import ProfileConfig, ProjectConfig, ExecutionConfig
+from cosmos.profiles import PostgresUserPasswordProfileMapping
+from pathlib import Path
 
-# Set base directory and parent directory paths
-base_directory_path = os.path.dirname(os.path.abspath(__file__))
-parent_directory_path = os.path.dirname(base_directory_path)
-parent_dir_name = os.path.basename(os.path.dirname(base_directory_path))
-directory_name = os.path.basename(base_directory_path)
-dynamic_dag_id = f"{parent_dir_name}_{directory_name}"
+def on_failure_callback(context,SVC_NAME):
+    svc=SVC_NAME
+    task=context.get("task_instance").task_id
+    dag=context.get("task_instance").dag_id
+    ti=context.get("task_instance")
+    exec_date=context.get("execution_date")
+    dag_run = context.get('dag_run')
+    log_url = context.get("task_instance").log_url
+    #log_url = log_url.replace(log_url.split('/')[2],'mpmathew-test-poc.03907124.lowtouch.cloud')
+    msg = f""" 
+            SVC: {svc}
+            Dag: {dag}
+            Task: {task}
+            DagRun: {dag_run}
+            TaskInstance: {ti}
+            Log Url: {log_url} 
+            Execution Time: {exec_date} 
+            """
+    print(msg)
 
-# Load configuration from YAML file
-yml_file_path = os.path.join(parent_directory_path, 'snowflake_ci.yml')
-with open(yml_file_path, 'r') as file:
-    config = yaml.safe_load(file)
-
-# Extract configuration variables
-SNOWFLAKE_CONN_ID = config.get('SNOWFLAKE_CONN_ID', 'DEFAULT_CONNECTION')
-SNOWFLAKE_SCHEMA = config.get('SNOWFLAKE_SCHEMA','DEFAULT_SCHEMA')
-
-# # Fetch Snowflake schema from the connection and folder
-# extras = BaseHook.get_connection(SNOWFLAKE_CONN_ID).extra_dejson
-# SNOWFLAKE_SCHEMA = extras['database'] + "." + directory_name
-
-OWNER = config.get('OWNER', 'DEFAULT_OWNER')
-TAGS = config.get('TAGS', [])
-
-# Add owner to tags
-TAGS.append(OWNER)
-
-# Set default arguments for the DAG
-default_args = {
-    "owner": OWNER,
-    "snowflake_conn_id": SNOWFLAKE_CONN_ID,
-}
-
-# # Read the content of README.md
-# readme_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'README.md')
-# with open(readme_path, 'r') as file:
-#     readme_content = file.read()
-
-# Initialize the DAG
-dag = DAG(
-    dynamic_dag_id,
-    default_args=default_args,
-    description='Run SQL files in Snowflake, organized by subdirectories',
-    schedule_interval=None,
-    template_searchpath=base_directory_path,
-    start_date=days_ago(1),
-    tags=TAGS,
-    # doc_md=readme_content,
+profile_config = ProfileConfig(
+    profile_name="jaffle_shop",
+    target_name="dev",
+    profiles_yml_filepath = "/appz/home/airflow/dags/dbt/jaffle_shop/profiles.yml",
 )
 
-# Define target subdirectories
-target_subdirs = [
-    'file_formats', 
-    'stages', 
-    'tables',
-    'views',
-    'sequences',
-    'streams', 
-    'functions', 
-    'procedures',
-    'tasks',
-    'dml'
-]
+def print_variable(**kwargs):
+  #line changed
+  variable = kwargs['dag_run'].conf.get('payment_type')
+  print(variable)
 
-obj_yml_file_path = os.path.join(base_directory_path, 'objects.yml')
-if os.path.exists(obj_yml_file_path):
-    with open(obj_yml_file_path, 'r') as file:
-        object_dirs = yaml.safe_load(file)
-        if 'OBJECTS' in object_dirs and object_dirs['OBJECTS']:
-            target_subdirs = object_dirs['OBJECTS']
+with DAG(
+    dag_id="jaffle_shop",
+    start_date=datetime(2023, 11, 10),
+    schedule='0 0/12 * * *',
+    tags=["airflow"],
+    default_args = {
+    "owner": "airflow"
+    },
+    catchup=False,
+):
+    e1 = PythonOperator(task_id = "print_variables",
+                        python_callable = print_variable,
+                        provide_context=True,
+                       )
 
+    seeds_tg = DbtTaskGroup(
+        project_config=ProjectConfig(
+        Path("/appz/home/airflow/dags/dbt/jaffle_shop"),
+    ),
+        operator_args={
+            "append_env": True,
+        },
+        profile_config=profile_config,
+        execution_config=ExecutionConfig(
+        dbt_executable_path="/dbt_venv/bin/dbt",
+    ),
+        render_config=RenderConfig(
+        select=["path:seeds/"],
+    ),
+        default_args={"retries": 2},
+        group_id = "dbt_seeds_group"
+    )
 
-# Create task groups and tasks
-task_groups = {}
-prev_group = None
+    stg_tg = DbtTaskGroup(
+        project_config=ProjectConfig(
+        Path("/appz/home/airflow/dags/dbt/jaffle_shop"),
+    ),
+        operator_args={
+            "append_env": True,
+        },
+        profile_config=profile_config,
+        execution_config=ExecutionConfig(
+        dbt_executable_path="/dbt_venv/bin/dbt",
+    ),
+        render_config=RenderConfig(
+        select=["path:models/staging/"],
+    ),
+        default_args={"retries": 1,
+                     'on_failure_callback': lambda context: on_failure_callback(context,"TEST_SVC_NAME"),},
+        group_id = "dbt_stg_group"
+    )
 
-for subdir_name in target_subdirs:
-    subdir_path = os.path.join(base_directory_path, subdir_name)
+    dbt_tg = DbtTaskGroup(
+        project_config=ProjectConfig(
+        Path("/appz/home/airflow/dags/dbt/jaffle_shop"),
+    ),
+        operator_args={
+            "append_env": True,
+           # "queue": "on-premises",
+        },
+        profile_config=profile_config,
+        execution_config=ExecutionConfig(
+        dbt_executable_path="/dbt_venv/bin/dbt",
+    ),
+        render_config=RenderConfig(
+        exclude=["path:models/staging","path:seeds/"],
+    ),
+        default_args={"retries": 2},
+    )
     
-    if not os.path.isdir(subdir_path):
-        continue
+    # send_email = EmailOperator( 
+    #     task_id='send_email', 
+    #     to='mpmathew@ecloudcontrol.com', 
+    #     subject='test email for airflow', 
+    #     html_content="Date: {{ ds }}", 
+    # )
+   
+    e2 = EmptyOperator(task_id="post_dbt")
     
-    n_tasks = 0
-    for file in sorted(os.listdir(subdir_path)):
-            if file.endswith('.sql'):
-                n_tasks = n_tasks + 1
-    
-    if n_tasks > 0:
-        with TaskGroup(group_id=subdir_name, dag=dag) as tg:
-            prev_task = None
-            
-            for file in sorted(os.listdir(subdir_path)):
-                if file.endswith('.sql'):
-                    file_path = os.path.join(subdir_path, file)
-                    task_id = f"{file.replace('.sql', '')}"
-                    
-                    with open(file_path, 'r') as f:
-                        sql_query = f.read()
 
-                        # Inject schema name into the SQL query if not already present
-                        if "USE" not in sql_query.upper():
-                            sql_query = f"USE {SNOWFLAKE_SCHEMA};\n" + sql_query
-                        
-                        task = SnowflakeOperator(
-                            task_id=task_id,
-                            sql=sql_query,
-                            snowflake_conn_id=SNOWFLAKE_CONN_ID,
-                            params={"schema_name": SNOWFLAKE_SCHEMA},
-                            dag=dag,
-                        )
-                    
-                        if prev_task:
-                            prev_task >> task 
-                    
-                        prev_task = task
-
-            task_groups[subdir_name] = tg
-            
-            if prev_group:
-                prev_group >> tg
-            
-            prev_group = tg
+    #e1 >> seeds_tg >> send_email >> stg_tg >> dbt_tg >> e2
+e1 >> seeds_tg >> stg_tg >> dbt_tg >> e2
+#testing16
